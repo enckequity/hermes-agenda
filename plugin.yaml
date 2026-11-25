@@ -2,7 +2,7 @@ name: agenda
 version: "1.0.1"
 author: Zubair Shaik
 requires_hermes: ">=0.23.0"
-description: "The agent's running todo list: shown every turn, one `agenda` tool to add/tick/drop/snooze/edit/search; closed items go to a searchable archive; reminders via the wake plugin."
+description: "The agent's running todo list: shown every turn, one `agenda` tool to add/tick/drop/snooze/edit/search; closed items go to a searchable archive. It never schedules jobs itself; due items are raised in conversation."
 provides_hooks:
   - pre_llm_call
 provides_tools:
@@ -22,14 +22,9 @@ config_schema:
     type: integer
     default: 300
     label: Context budget (tokens)
-    description: Max size of the per-turn injection (about 4 chars per token). Only items due within 24h are injected (max 5); nothing due means nothing injected. `agenda list` shows everything.
+    description: Max size of the per-turn injection (about 4 chars per token). Only items due within 24h are injected (max 3, then a count); nothing due means nothing injected. `agenda list` shows everything.
   reminders:
     type: string
-    default: wake
+    default: "off"
     label: Hard-deadline alarms
-    description: "wake (needs the wake plugin; your agent messages you in your chat), cron (one-shot Hermes cron job, posted to cron_deliver), or off. Snooze and the per-turn list work without any of these."
-  cron_deliver:
-    type: string
-    default: local
-    label: Where cron reminders go
-    description: "Only for reminders: cron. Any hermes cron --deliver target, e.g. telegram, discord, bot-chat, local."
+    description: "Always off: the agenda never creates scheduled jobs. For a hard deadline the assistant offers a scheduled job, which you confirm first."

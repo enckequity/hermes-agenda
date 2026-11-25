@@ -4,9 +4,11 @@ Open items live in $HERMES_HOME/agenda/open.json. Ticked or dropped items move t
 $HERMES_HOME/agenda/archive.jsonl (append-only, searchable) so nothing is lost.
 Settings (user_name, timezone, reminders) come from plugins.entries.agenda.settings via the plugin context.
 A pre_llm_call hook shows the open list; one tool lets the model add, tick,
-drop, snooze, edit and search. Reminders use `hermes wake` or a one-shot `hermes cron` job.
+drop, snooze, edit and search. The plugin never schedules jobs itself: a hard deadline that must
+fire while the person is silent goes through the engine's own `cronjob_manage` tool, which asks them first.
+Every read-modify-write of open.json holds an flock on open.json.lock and writes atomically.
 """
-import hashlib, json, os, re, secrets, subprocess, time
+import contextlib, fcntl, hashlib, json, os, re, secrets, subprocess, tempfile, time
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -46,7 +48,7 @@ SOFT_CAP = 15
 TEXT_MAX, CONTEXT_MAX = 120, 300  # chars per item; enforced on add/edit
 DETAIL_HOURS = 48  # `agenda list`: items due this soon show their context line
 INJECT_HOURS = 24  # per-turn injection: only items due within this window (or overdue)
-INJECT_MAX = 5     # and at most this many; the rest are a count
+INJECT_MAX = 3     # and at most this many; the rest are a count
 FULL_EVERY = 3600  # re-show the full list at least hourly per chat, else only when it changes
 
 
@@ -124,85 +126,61 @@ def _load():
         return []
 
 
-def _save(items):
-    f = _open_f()
+def _atomic_write(f, text):
+    """Write via a unique temp file in the same directory, then os.replace (never a torn file)."""
     f.parent.mkdir(parents=True, exist_ok=True)
-    tmp = f.with_suffix(".tmp")
-    tmp.write_text(json.dumps(items, indent=1, ensure_ascii=False))
-    os.replace(tmp, f)
-
-
-def _cfg(*keys, default=None):
+    fd, tmp = tempfile.mkstemp(prefix=f".{f.name}.", suffix=".tmp", dir=str(f.parent))
     try:
-        from hermes_cli.config import cfg_get, load_config
-        return cfg_get(load_config(), *keys, default=default)
-    except Exception:
-        return default
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        os.replace(tmp, f)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
-def _wake_enabled():
-    """True when the wake plugin is enabled in this profile (plugins.enabled, not plugins.disabled)."""
-    enabled, disabled = _cfg("plugins", "enabled", default=[]), _cfg("plugins", "disabled", default=[])
-    return isinstance(enabled, list) and "wake" in enabled and not (isinstance(disabled, list) and "wake" in disabled)
+def _save(items):
+    _atomic_write(_open_f(), json.dumps(items, indent=1, ensure_ascii=False))
 
 
-def _truthy(v):
-    return str(v).strip().lower() in ("1", "true", "yes", "on")
-
-
-def _cron_blocked():
-    """Inside a cron run, scheduling a new cron job needs cron.allow_agent_scheduling (same switch as core's cronjob tool)."""
-    try:
-        from gateway.session_context import get_session_env
-        in_cron = _truthy(get_session_env("HERMES_CRON_SESSION", ""))
-    except Exception:
-        in_cron = _truthy(os.environ.get("HERMES_CRON_SESSION", ""))
-    return in_cron and not _truthy(_cfg("cron", "allow_agent_scheduling", default=False))
+@contextlib.contextmanager
+def _locked():
+    """Exclusive flock on the sidecar open.json.lock for one whole read-modify-write."""
+    d = _dir()
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / "open.json.lock", "a") as lk:
+        fcntl.flock(lk.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lk.fileno(), fcntl.LOCK_UN)
 
 
 def _backend():
-    return _setting("reminders", "wake" if _wake_enabled() else "cron")
+    """TeamShift: always "off". The plugin never creates a scheduled job itself (no `hermes cron create`,
+    no wake, no jobs-file write); a hard deadline goes through the engine's `cronjob_manage` tool, whose
+    "Schedule this job?" card asks the person first. Any old settings value is ignored."""
+    return "off"
 
 
 def _wake(cmd, *args):
-    """Hard-deadline alarms. Backend from settings.reminders: "wake" (wake plugin: the agent itself
-    is woken in your chat, via `hermes wake`), "cron" (one-shot Hermes cron job delivered to
-    settings.cron_deliver), or "off". Returns an id ("cron:<id>" for cron) or None."""
-    backend = _backend()
+    """Only cancels a one-shot cron job an older version of this plugin created ("cron:<id>"); never creates one."""
     try:
         if cmd == "cancel" and args and str(args[0]).startswith("cron:"):
             _run(["hermes", "cron", "remove", args[0][5:]], 30)
-            return None
-        if backend == "off":
-            return None
-        if backend == "cron":
-            if cmd != "add" or _cron_blocked():
-                return None
-            when = datetime.strptime(args[0], "%Y-%m-%d %H:%M").replace(tzinfo=_tz())
-            out = _run(["hermes", "cron", "create", when.isoformat(timespec="minutes"), args[1],
-                        "--name", "agenda-reminder", "--repeat", "1",
-                        "--deliver", _setting("cron_deliver", "local")], 30).stdout
-            m = re.search(r"Created job: ([0-9a-f]{12})", out)
-            return f"cron:{m[1]}" if m else None
-        out = _run(["hermes", "wake", cmd, *args], 30).stdout
-        m = re.search(r"wake ([0-9a-f]{12})", out)
-        return m[1] if m else None
     except Exception:
-        return None
+        pass
+    return None
 
 
 def _set_wake(item, when, why):
-    """Set the item's alarm; returns a note for the model when no alarm could be set."""
+    """No alarm is created here. Returns a note telling the model how to ask for one."""
     if item.get("wake_id"):
         _wake("cancel", item.pop("wake_id"))
-    if _backend() == "cron" and _cron_blocked():
-        return "reminder not set: this is a cron run and cron.allow_agent_scheduling is off"
-    wid = _wake("add", when.strftime("%Y-%m-%d %H:%M"),
-                f"Agenda [{item['id']}] {why}: {item['text']}. Check it, then act or message {_user()}; update the agenda.")
-    if wid:
-        item["wake_id"] = wid
-        return ""
-    return "" if _backend() == "off" else "reminder not set: the reminder backend did not confirm it"
+    item["remind_at"] = when.isoformat(timespec="minutes")
+    return (f"no alarm set: the agenda never schedules jobs itself. If this must fire at {_fmt(item['remind_at'])}"
+            " even when they are silent, offer it with the cronjob_manage tool, which asks them to confirm.")
 
 
 def _render(items, now, budget=None):
@@ -272,10 +250,16 @@ def _render_due(items, now, budget):
     return "\n".join(lines)
 
 
+def _persons_turn(kw):
+    """Inject only on a person's own turn: never on cron or kanban turns, kanban workers or delegated children."""
+    return (kw.get("platform") or "") not in ("cron", "kanban") and not os.environ.get("HERMES_KANBAN_TASK") \
+        and not kw.get("parent_session_id")
+
+
 def on_pre_llm_call(**kw):
     try:
         sid = str(kw.get("session_id") or "")
-        if not sid or kw.get("parent_session_id"):
+        if not sid or not _persons_turn(kw):
             return None
         items = _load()
         if not items:
@@ -294,8 +278,7 @@ def on_pre_llm_call(**kw):
         if full:
             seen[sid] = {"h": h, "t": time.time()}
             seen = dict(sorted(seen.items(), key=lambda kv: kv[1]["t"])[-200:])
-            _dir().mkdir(parents=True, exist_ok=True)
-            _seen_f().write_text(json.dumps(seen))
+            _atomic_write(_seen_f(), json.dumps(seen))
             return {"context": body}
         return {"context": body.split(" (tool", 1)[0] + ", unchanged since last shown."}
     except Exception:
@@ -323,7 +306,14 @@ def _too_long(args):
         return f"error: context over {CONTEXT_MAX} chars; keep why/source/next step only"
 
 
-def handle(args, **_):
+def handle(args, **kw):
+    if args.get("action") in ("list", "search"):
+        return _handle(args, **kw)
+    with _locked():
+        return _handle(args, **kw)
+
+
+def _handle(args, **_):
     a = args.get("action")
     items, now = _load(), _now()
     find = lambda i: next((x for x in items if x["id"] == i), None)
@@ -400,7 +390,7 @@ SCHEMA = {
         "Your running todo list. Items due within 24h are shown to you each turn; `list` shows the rest. Add anything you owe the user or are waiting on them for. "
         "Every item needs `when` (today, tomorrow, this week, a date or a time: when it must happen or be looked at) "
         "and `context` (why it matters, where it came from, the next step). Items are raised in conversation when due, not by alarms. Security alerts (sign-ins, password or recovery changes) and money at risk are never agenda items: tell the user right away. "
-        "Use remind_at ONLY for hard deadlines that must fire even if the user is silent (flight check-in, a renewal cutoff, a timed job of yours). "
+        "Use remind_at ONLY for hard deadlines that must fire even if the user is silent (flight check-in, a renewal cutoff, a timed job of yours); it never schedules a job itself. "
         "Snooze hides an item until a time; it comes back into this list then, with no alarm. If the user defers: 'later' = +2h, 'tomorrow' only if they say it, else the time they name. "
         "Tick (done) or drop items the moment they resolve, with a short note; they move to a searchable archive. "
         "Keep it under 15 open: merge or drop stale items. Times: today, tomorrow, this week, next week, +2h, 14:30, 2026-11-20, 2026-11-20 14:30."
@@ -412,7 +402,7 @@ SCHEMA = {
         "owner": {"type": "string", "enum": ["me", "user"], "description": "who has the next move (default me)"},
         "when": {"type": "string", "description": "required on add: when it must happen or be looked at"},
         "context": {"type": "string", "description": "required on add: why it matters, source, next step (1-2 lines)"},
-        "remind_at": {"type": "string", "description": "hard deadlines only: schedules a wake that fires even if the user is silent"},
+        "remind_at": {"type": "string", "description": "hard deadlines only: records the alarm time; no job is scheduled here (offer one with cronjob_manage, which asks the user)"},
         "until": {"type": "string", "description": "snooze: hide until this time (default +2h); no alarm"},
         "note": {"type": "string", "description": "done/drop: outcome, kept in the archive"},
         "query": {"type": "string", "description": "search: text to find in the archive"},
